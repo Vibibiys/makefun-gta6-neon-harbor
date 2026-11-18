@@ -1,24 +1,44 @@
-// A working gta6-01 entry (Node 22, standard library only): the game is this directory's
-// game/ folder, plain static files a desktop browser loads offline (game/index.html and its ES
-// modules, no library and no network request), and the program hands it in. It copies game/ and
-// screenshots/ from beside this file to /output and writes /output/dossier.json, the summary the
-// judge reads, with the vendored make.fun library. Only the plumbing, not an open world: Block
-// Dodger, a plain 2D canvas game where a paddle dodges falling blocks and catches coins, with a
-// title screen, score, lives and levels, game over and restart, flat colours and no sound. Build
-// your own open-world crime game in its place (three.js or any library you vendor under game/),
-// put your 3 or 4 PNG or JPEG screenshots in screenshots/ (the first by name is the cover) and run it.
+// Neon Harbor: Vice Run — an original top-down 2D open-world crime game for make.fun
+// gta6-01, authored for this entry. Mara Voss, a courier in the port city of Neon Harbor,
+// takes one job too many: six story missions across a 3840x2880 canvas city with traffic,
+// pedestrians, gangs, a witness-driven wanted system and police who will bust or waste
+// her, plus side activities, pickups, a day-night cycle and procedural audio. The game is
+// plain ES modules on a single canvas — no libraries, no network, no external assets —
+// and lives in this directory's game/ folder (game/index.html and game/src/*.js).
+//
+// This program is the hand-in plumbing (Node 22, standard library only): it copies game/
+// and screenshots/ from beside this file to /output and writes /output/dossier.json, the
+// summary the judge reads, with the vendored make.fun library. Before copying, it runs
+// the authored Neon Harbor checks below so a broken entry fails here, loudly, instead
+// of failing silently in front of the scorer.
 //
 // Serve it locally with `node serve.ts`, then open http://localhost:8080.
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 
-import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+
+// Authored Neon Harbor checks: the entry is only worth handing in if the game
+// itself is really here — its page, its integrator module — and the screenshot
+// set is the 3 or 4 shots the bounty asks for (the first by name is the cover).
+if (!existsSync(join(here, 'game', 'index.html'))) {
+  throw new Error('Neon Harbor: Vice Run is missing game/index.html — nothing to hand in.');
+}
+if (!existsSync(join(here, 'game', 'src', 'main.js'))) {
+  throw new Error('Neon Harbor: Vice Run is missing game/src/main.js — the game cannot boot.');
+}
+const shotFiles = existsSync(join(here, 'screenshots'))
+  ? readdirSync(join(here, 'screenshots')).filter((name) => /\.(png|jpe?g)$/i.test(name))
+  : [];
+if (shotFiles.length < 3 || shotFiles.length > 4) {
+  throw new Error(`Neon Harbor: Vice Run needs 3 or 4 screenshots, found ${shotFiles.length}.`);
+}
 
 mkdirSync(out, { recursive: true });
 cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });

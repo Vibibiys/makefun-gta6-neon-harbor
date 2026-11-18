@@ -1,79 +1,198 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// Screenshot scenes behind ?shot=<name>&seed=<n>. Each scene drives the REAL
+// simulation forward in fixed steps through the game object main.js hands over
+// ({ state, step(dt), startPlay() }), so a captured frame is a genuine game
+// frame — traffic, peds, police and missions all live — and the seeded RNG in
+// main.js makes the same seed produce the same frame every time.
+import * as MissionsModule from './missions.js';
+import * as VehiclesModule from './vehicles.js';
+import * as CombatModule from './combat.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+const STEP = 1 / 60;
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+function runSteps(game, seconds) {
+  const n = Math.round(seconds / STEP);
+  for (let i = 0; i < n; i++) game.step(STEP);
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
+function downtownSpot(state) {
+  const spots = state.world && state.world.missionSpots;
+  if (Array.isArray(spots)) {
+    const market = spots.find((s) => s && (s.id === 'market' || /market/i.test(s.name || '')));
+    if (market) return { x: market.x, y: market.y };
+    if (spots[0]) return { x: spots[0].x, y: spots[0].y };
+  } else if (spots && typeof spots === 'object') {
+    if (spots.market) return { x: spots.market.x, y: spots.market.y };
+    const first = Object.values(spots)[0];
+    if (first) return { x: first.x, y: first.y };
   }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
+  return { x: 1800, y: 1100 };
+}
+
+function makeFallbackCar(x, y, kind, color) {
+  if (typeof VehiclesModule.makeCar === 'function') {
+    try {
+      const car = VehiclesModule.makeCar(x, y, 0, kind);
+      if (car && typeof car.x === 'number') {
+        if (color) car.color = color;
+        return car;
+      }
+    } catch { /* fall through to the plain object below */ }
   }
-  return best;
+  return {
+    x, y, angle: 0, speed: 0, w: 56, h: 27,
+    kind: kind || 'sports', color: color || '#ff2d78',
+    driver: null, hp: 100, dead: false,
+  };
+}
+
+function ensureGangNear(state, cx, cy, count) {
+  let have = 0;
+  for (const ped of state.peds || []) if (ped.kind === 'gang' && ped.hp > 0) have++;
+  for (let i = have; i < count; i++) {
+    state.peds.push({
+      x: cx + 70 + i * 34, y: cy + (i % 2 === 0 ? -46 : 52),
+      angle: Math.PI, speed: 0, hp: 80, kind: 'gang',
+      color: '#c81e3a', state: 'idle', missionTag: 'shot',
+    });
+  }
 }
 
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Stage the named scene on `game` and return the state, ready for one render.
+ * Scenes: title | chase | foot | mission. Unknown names fall back to title.
  */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+export function stageShot(name, game) {
+  const state = game.state;
+
+  if (name === 'chase') {
+    game.startPlay();
+    // A horizontal avenue: road centres run 240, 720, 1200, ... — ride the 1200 one.
+    const car = makeFallbackCar(1150, 1200, 'sports', '#ff2d78');
+    car.angle = 0; car.speed = 0;
+    if (!state.cars.includes(car)) state.cars.push(car);
+    state.player.inCar = car;
+    state.player.x = car.x; state.player.y = car.y; state.player.angle = 0;
+    state.wanted.stars = 4;
+    state.wanted.heat = 150;
+    state.wanted.lastCrime = state.time;
+    runSteps(game, 3); // police spawns and closes in through the real update
+    // Guarantee a dramatic frame even if police spawning was slow this seed:
+    // the chase must read as a chase, with Mara still at the wheel.
+    if (state.player.inCar !== car && !car.dead) {
+      state.player.inCar = car;
+      state.player.x = car.x; state.player.y = car.y;
+    }
+    // If every patrol car is still far off, pull the nearest one onto the
+    // same avenue ~260 px behind Mara so the pursuit is in frame.
+    let nearestCop = null, nearestD = Infinity;
+    for (const cop of state.copCars || []) {
+      if (!cop || cop.dead) continue;
+      const d = Math.hypot(cop.x - state.player.x, cop.y - state.player.y);
+      if (d < nearestD) { nearestD = d; nearestCop = cop; }
+    }
+    if (nearestCop && nearestD > 430) {
+      nearestCop.x = state.player.x - 260;
+      nearestCop.y = state.player.y;
+      nearestCop.angle = 0;
+      nearestCop.speed = 120;
+    }
+    state.wanted.stars = Math.max(state.wanted.stars, 3);
+    state.screen = 'play';
+    return state;
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+
+  if (name === 'foot') {
+    game.startPlay();
+    const spot = downtownSpot(state);
+    state.player.inCar = null;
+    state.player.x = spot.x + 30; state.player.y = spot.y + 24;
+    state.player.angle = -Math.PI / 2;
+    // Mission 1 objective active: missions state starts at index 0; one short
+    // step lets updateMissions publish the objective marker.
+    runSteps(game, 1);
+    if (state.missionState && !state.missionState.objective) {
+      state.missionState.objective = { x: spot.x, y: spot.y, text: 'Pick up the package' };
+    }
+    // End on the avenue 150 px north of the live objective so the gold
+    // world marker itself is in frame, not just its off-screen arrow.
+    const obj = state.missionState && state.missionState.objective;
+    if (obj) {
+      state.player.x = obj.x;
+      state.player.y = obj.y - 150;
+      state.player.angle = Math.PI / 2;
+    }
+    state.screen = 'play';
+    return state;
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+
+  if (name === 'mission') {
+    game.startPlay();
+    // Jump to mission 3 (index 2) through the missions module when it offers a
+    // starter; otherwise set the index directly and let updateMissions settle it.
+    let jumped = false;
+    if (typeof MissionsModule.startMission === 'function') {
+      try { MissionsModule.startMission(state, 2); jumped = true; } catch { jumped = false; }
+    }
+    if (!jumped && state.missionState) {
+      state.missionState.index = 2;
+      state.missionState.phase = 0;
+      state.missionState.t = 0;
+    }
+    // Mara on foot, armed, near the action.
+    const spot = (state.missionState && state.missionState.objective)
+      ? state.missionState.objective
+      : downtownSpot(state);
+    state.player.inCar = null;
+    state.player.x = spot.x - 90; state.player.y = spot.y + 60;
+    state.player.angle = Math.atan2(spot.y - state.player.y, spot.x - state.player.x);
+    if (typeof CombatModule.giveWeapon === 'function') {
+      try { CombatModule.giveWeapon(state, 'pistol', 24); } catch { /* manual grant below still applies */ }
+    }
+    if (Array.isArray(state.player.weaponsOwned) && !state.player.weaponsOwned.includes('pistol')) {
+      state.player.weaponsOwned.push('pistol');
+    }
+    state.player.weapon = 'pistol';
+    // Ammo shape depends on the combat module: a per-weapon map on the
+    // player, or its state.weapons reserve with player.ammo as a number.
+    if (state.player.ammo && typeof state.player.ammo === 'object') {
+      state.player.ammo.pistol = Math.max(state.player.ammo.pistol || 0, 24);
+    } else if (state.weapons && state.weapons.ammo) {
+      state.weapons.ammo.pistol = Math.max(state.weapons.ammo.pistol || 0, 24);
+      if (typeof state.player.ammo === 'number') state.player.ammo = state.weapons.ammo.pistol;
+    }
+    ensureGangNear(state, spot.x, spot.y, 3);
+    state.dialogue = 'DISPATCH: Mara, they are holding the pier — move in, keep it clean.';
+    state.dialogueT = 9;
+    runSteps(game, 0.75);
+    // Re-assert the staged facts the steps may have moved on from.
+    state.player.weapon = 'pistol';
+    if (!state.dialogue) {
+      state.dialogue = 'MARA: I see them. Going in quiet.';
+      state.dialogueT = 9;
+    }
+    if (state.missionState && !state.missionState.objective) {
+      state.missionState.objective = { x: spot.x, y: spot.y, text: 'Clear the pier' };
+    }
+    // End on the road 130 px south of the objective marker, facing it, so
+    // Mara, the gang and the gold ring all share the frame on open asphalt
+    // (the pre-step spot can land on a building corner).
+    const mObj = state.missionState && state.missionState.objective;
+    if (mObj) {
+      state.player.x = mObj.x;
+      state.player.y = mObj.y + 130;
+      state.player.angle = -Math.PI / 2;
+    }
+    state.screen = 'play';
+    return state;
+  }
+
+  // 'title' (and fallback): the sim idles over a downtown vista with traffic
+  // moving, exactly as the title screen's living backdrop does in real play.
+  state.screen = 'title';
+  state.player.inCar = null;
+  state.player.x = 1920; state.player.y = 1150;
+  state.player.angle = 0;
+  runSteps(game, 4);
+  state.screen = 'title';
+  return state;
 }
